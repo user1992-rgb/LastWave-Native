@@ -371,6 +371,8 @@ class MusicPlayer @Inject constructor(
     private var currentRadioContinuationToken: String? = null
     @Volatile
     private var currentRadioAutomixPlaylistId: String? = null
+    @Volatile
+    private var anchoredRadio: AnchoredRadio? = null
     internal var unavailableSkipJob: Job? = null
     internal val unavailableMediaIds = mutableSetOf<String>()
     /**
@@ -4774,6 +4776,7 @@ class MusicPlayer @Inject constructor(
         radioUsedSeeds.clear()
         currentRadioContinuationToken = null
         currentRadioAutomixPlaylistId = null
+        anchoredRadio = null
     }
 
     private suspend fun <T> retryRadioRequest(
@@ -4799,20 +4802,25 @@ class MusicPlayer @Inject constructor(
         return null
     }
 
-    private suspend fun reseedWithLastQueueSong(
+    private suspend fun reseedRadio(
         currentQueue: List<PlayableTrack>,
         knownVideoIds: Set<String>,
         knownKeys: Set<String>,
         knownSongKeys: Set<String>,
         recentHistoryKeys: Set<String>,
     ): List<PlayableTrack> {
-        val candidateTrack = currentQueue.asReversed().firstOrNull {
-            !it.videoId.isNullOrBlank() && it.videoId !in radioUsedSeeds
-        } ?: run {
-            // Recycle seeds so endless radio playback never terminates
-            radioUsedSeeds.clear()
-            currentQueue.lastOrNull { !it.videoId.isNullOrBlank() }
-        }
+        // Seeding from the last queued song made every refill drift one hop
+        // further from the user's pick; seed from the anchor batch first.
+        val anchor = anchoredRadio
+        val isFresh = { track: PlayableTrack -> !track.videoId.isNullOrBlank() && track.videoId !in radioUsedSeeds }
+        val candidateTrack = anchor?.anchorSeeds?.firstOrNull(isFresh)
+            ?: currentQueue.asReversed().firstOrNull { isFresh(it) && anchor?.inPool(it) != false }
+            ?: run {
+                // Recycle seeds so endless radio playback never terminates
+                radioUsedSeeds.clear()
+                anchor?.anchorSeeds?.firstOrNull { !it.videoId.isNullOrBlank() }
+                    ?: currentQueue.lastOrNull { !it.videoId.isNullOrBlank() }
+            }
         val seedVideoId = candidateTrack?.videoId
         if (seedVideoId == null) {
             android.util.Log.d("MusicPlayer", "No fresh seed track available for radio re-seeding; stopping extending quietly")
@@ -4885,6 +4893,7 @@ class MusicPlayer @Inject constructor(
         radioUsedSeeds.clear()
         currentRadioContinuationToken = null
         currentRadioAutomixPlaylistId = null
+        anchoredRadio = null
         seed.videoId?.takeIf(String::isNotBlank)?.let { radioUsedSeeds.add(it) }
 
         val expectedGeneration = playRequestGeneration.get()
@@ -4995,6 +5004,20 @@ class MusicPlayer @Inject constructor(
 
                     if (toAdd.isEmpty() || !radioQueueActive || expectedGeneration != playRequestGeneration.get()) return@withLock
 
+                    val bandTracks = seed.artist.takeIf(String::isNotBlank)?.let { artist ->
+                        retryRadioRequest { innerTube.searchSongs(artist, limit = 25) }
+                    }.orEmpty().map { it.toPlayableTrack() }
+                    if (expectedGeneration != playRequestGeneration.get() || !radioQueueActive) return@withLock
+                    val anchor = AnchoredRadio(seed, toAdd, bandTracks)
+                    anchoredRadio = anchor
+                    val excludedSongKeys = discoverRepository.recommendationExclusionKeys()
+                    val shapedToAdd = anchor.shape(toAdd, filterToPool = false) {
+                        it.videoId in existingVideoIds || it.videoId in recentHistoryKeys ||
+                            PureRadioQueue.normalizedSongKey(it.title, it.artist).let { key ->
+                                key in existingSongKeys || key in excludedSongKeys
+                            }
+                    }
+
                     withContext(Dispatchers.Main.immediate) {
                         if (!radioQueueActive || !playerDelegate.isInitialized() || expectedGeneration != playRequestGeneration.get()) return@withContext
                         val current = player.currentMediaItem?.toPlayableTrack()
@@ -5010,7 +5033,7 @@ class MusicPlayer @Inject constructor(
                         val currentKeys = (0 until player.mediaItemCount).mapTo(mutableSetOf()) {
                             player.getMediaItemAt(it).toPlayableTrack().queueKey()
                         }
-                        val validToAdd = toAdd.filter { it.queueKey() !in currentKeys }
+                        val validToAdd = shapedToAdd.filter { it.queueKey() !in currentKeys }
                         if (validToAdd.isNotEmpty()) {
                             val previousCount = player.mediaItemCount
                             appendToQueueEnd(validToAdd.map(PlayableTrack::toMediaItem))
@@ -5112,11 +5135,11 @@ class MusicPlayer @Inject constructor(
                         if (automixFiltered.isNotEmpty()) {
                             automixFiltered
                         } else {
-                            reseedWithLastQueueSong(currentQueue, knownVideoIds, knownKeys, knownSongKeys, recentHistoryKeys)
+                            reseedRadio(currentQueue, knownVideoIds, knownKeys, knownSongKeys, recentHistoryKeys)
                         }
                     } else {
                         currentRadioContinuationToken = null
-                        reseedWithLastQueueSong(currentQueue, knownVideoIds, knownKeys, knownSongKeys, recentHistoryKeys)
+                        reseedRadio(currentQueue, knownVideoIds, knownKeys, knownSongKeys, recentHistoryKeys)
                     }
                 } else if (!automixId.isNullOrBlank()) {
                     currentRadioAutomixPlaylistId = null
@@ -5140,15 +5163,34 @@ class MusicPlayer @Inject constructor(
                     if (automixFiltered.isNotEmpty()) {
                         automixFiltered
                     } else {
-                        reseedWithLastQueueSong(currentQueue, knownVideoIds, knownKeys, knownSongKeys, recentHistoryKeys)
+                        reseedRadio(currentQueue, knownVideoIds, knownKeys, knownSongKeys, recentHistoryKeys)
                     }
                 } else {
-                    reseedWithLastQueueSong(currentQueue, knownVideoIds, knownKeys, knownSongKeys, recentHistoryKeys)
+                    reseedRadio(currentQueue, knownVideoIds, knownKeys, knownSongKeys, recentHistoryKeys)
                 }
 
-                val finalToAdd = if (toAdd.isEmpty() && forceIfAtEnd) {
-                    reseedWithLastQueueSong(currentQueue, knownVideoIds, knownKeys, knownSongKeys, emptySet())
-                } else toAdd
+                val anchor = anchoredRadio
+                val excludedSongKeys = discoverRepository.recommendationExclusionKeys()
+                val isKnown: (PlayableTrack) -> Boolean = {
+                    it.videoId in knownVideoIds || it.videoId in recentHistoryKeys ||
+                        PureRadioQueue.normalizedSongKey(it.title, it.artist).let { key ->
+                            key in knownSongKeys || key in excludedSongKeys
+                        }
+                }
+                fun styled(batch: List<PlayableTrack>) = anchor?.shape(batch, filterToPool = true, isKnown) ?: batch
+
+                var finalToAdd = styled(toAdd)
+                // A page fully outside the style: go back to the anchor instead
+                // of waiting for the next page, which tends to drift further.
+                if (finalToAdd.isEmpty() && anchor != null && toAdd.isNotEmpty()) {
+                    finalToAdd = styled(reseedRadio(currentQueue, knownVideoIds, knownKeys, knownSongKeys, recentHistoryKeys))
+                }
+                if (finalToAdd.isEmpty() && forceIfAtEnd) {
+                    // Never let the music stop just because nothing matched the style.
+                    finalToAdd = reseedRadio(currentQueue, knownVideoIds, knownKeys, knownSongKeys, emptySet())
+                        .let { batch -> styled(batch).ifEmpty { batch } }
+                        .ifEmpty { toAdd }
+                }
 
                 if (finalToAdd.isEmpty() || !radioQueueActive || expectedGeneration != playRequestGeneration.get()) return@launch
 
